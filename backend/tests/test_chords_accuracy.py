@@ -143,6 +143,50 @@ class ChordAccuracyTests(unittest.TestCase):
         for c in res["beat_confidence"]:
             self.assertTrue(0.0 <= c <= 1.0, c)
 
+    def test_gmaj9_loop_does_not_over_dwell(self):
+        # Repeating 4-chord grid: stay-bias must not glue one triad for ~half the song.
+        # Shared D/F#/A tones make plain D tempting; loop transitions keep the cycle.
+        cycle = [
+            ([F["G2"], F["B2"], F["D3"], F["Fs3"], F["A3"]], F["G2"], "G"),
+            ([F["D3"], F["Fs3"], F["A3"]], F["D3"], "D"),
+            ([F["A2"], F["Cs3"], F["E3"]], F["A2"], "A"),
+            ([F["B2"], F["D3"], F["Fs3"], F["A3"]], F["B2"], "B"),
+        ]
+        n_reps = 3
+        segs = cycle * n_reps
+        harm = np.concatenate([_chord(fs) for fs, _, _ in segs])
+        bass = np.concatenate([_chord([b]) for _, b, _ in segs])
+        beats = np.arange(len(segs), dtype=float)
+        res = _recognize(harm, bass, beats)
+
+        def root_pc(label: str) -> str:
+            q = _root_quality(label)
+            if q.startswith("G"):
+                return "G"
+            if q.startswith("D"):
+                return "D"
+            if q.startswith("A"):
+                return "A"
+            if q.startswith("B"):
+                return "B"
+            return q
+
+        pcs = [root_pc(x) for x in res["beat_labels"]]
+        counts = {k: pcs.count(k) for k in ("G", "D", "A", "B")}
+        total = len(pcs)
+        self.assertEqual(total, len(segs), pcs)
+        for k, n in counts.items():
+            self.assertGreaterEqual(n, 2, f"{k} under-represented: {counts} labels={res['beat_labels']}")
+            self.assertLessEqual(n / total, 0.5, f"{k} over-dwells: {counts} labels={res['beat_labels']}")
+        # Sequence should still prefer the Gmaj9-family / D / A / Bm* cycle shape.
+        for i in range(0, total, 4):
+            self.assertIn(_root_quality(res["beat_labels"][i]), GMAJ9_FAMILY, res["beat_labels"])
+            self.assertEqual(_root_quality(res["beat_labels"][i + 1]), "D", res["beat_labels"])
+            self.assertEqual(_root_quality(res["beat_labels"][i + 2]), "A", res["beat_labels"])
+            self.assertIn(_root_quality(res["beat_labels"][i + 3]), BM7_FAMILY, res["beat_labels"])
+        for c in res["beat_confidence"]:
+            self.assertTrue(0.0 <= c <= 1.0, c)
+
     def test_sus2_without_third_stays_sus2(self):
         # Bare 0+2+7 must still prefer sus2 (not flood maj9/add9).
         harm = _chord([F["G2"], F["A3"], F["D3"]], 2.0)
