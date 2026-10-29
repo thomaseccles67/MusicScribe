@@ -9,7 +9,8 @@ const { ensureDirs, isDev, userDataDir, modelCacheDir } = require("./paths");
 let mainWindow = null;
 /** @type {HelperProcess | null} */
 let helper = null;
-let starting = false;
+/** Shared in-flight start so splash get-state waits instead of racing. */
+let startPromise = null;
 let lastError = null;
 let modelsReady = false;
 
@@ -63,35 +64,91 @@ function attachHelperLogs(proc) {
   });
 }
 
-async function startHelper() {
-  if (starting) return;
-  starting = true;
-  lastError = null;
-  try {
-    ensureDirs();
-    if (helper) {
-      await helper.stop();
-      helper = null;
-    }
-    helper = new HelperProcess();
-    attachHelperLogs(helper);
-    await helper.start();
-    modelsReady = await probeModelsReady();
-  } catch (err) {
-    lastError = err.message || String(err);
-    throw err;
-  } finally {
-    starting = false;
-  }
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function probeModelsReady() {
-  if (!helper) return false;
-  const url = `${helper.baseUrl()}/api/models`;
-  const res = await fetch(url);
-  if (!res.ok) return false;
-  const body = await res.json();
-  return Boolean(body.ready);
+/**
+ * Start (or await) the local helper. Concurrent callers share one promise so the
+ * splash cannot probe /api/models before waitUntilReady finishes — that race
+ * surfaced as undici's opaque "fetch failed" + Try again on every cold open.
+ */
+function startHelper({ force = false } = {}) {
+  if (startPromise && !force) return startPromise;
+
+  const prior = force ? startPromise : null;
+  startPromise = (async () => {
+    if (prior) {
+      try {
+        await prior;
+      } catch {
+        /* previous attempt failed — continue into a fresh start */
+      }
+    }
+    lastError = null;
+    try {
+      ensureDirs();
+      if (helper) {
+        await helper.stop();
+        helper = null;
+      }
+      helper = new HelperProcess();
+      attachHelperLogs(helper);
+      await helper.start();
+      modelsReady = await probeModelsReady();
+      return helper;
+    } catch (err) {
+      lastError = err.message || String(err);
+      // Allow a later retry to create a fresh startPromise.
+      startPromise = null;
+      throw err;
+    }
+  })();
+
+  return startPromise;
+}
+
+async function ensureHelperReady() {
+  if (helper && helper.isReady()) return helper;
+  // After a crash, startPromise may still be a resolved success from earlier —
+  // force a new start rather than returning that stale settlement.
+  if (startPromise && (!helper || !helper.isReady())) {
+    try {
+      await startPromise;
+      if (helper && helper.isReady()) return helper;
+    } catch {
+      /* fall through to restart */
+    }
+    return startHelper({ force: true });
+  }
+  return startHelper();
+}
+
+/**
+ * Probe model cache readiness. Retries briefly so a one-shot undici failure
+ * right after health OK does not strand the splash on "fetch failed".
+ */
+async function probeModelsReady({ retries = 12, delayMs = 250 } = {}) {
+  if (!helper || !helper.port) return false;
+  let lastErr = null;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const url = `${helper.baseUrl()}/api/models`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        lastErr = new Error(`Models probe HTTP ${res.status}`);
+        await sleep(delayMs);
+        continue;
+      }
+      const body = await res.json();
+      return Boolean(body.ready);
+    } catch (err) {
+      lastErr = err;
+      await sleep(delayMs);
+    }
+  }
+  if (lastErr) throw lastErr;
+  return false;
 }
 
 async function fetchJson(pathname, options) {
@@ -116,9 +173,7 @@ async function showModelsOrApp() {
 
 ipcMain.handle("desktop:get-state", async () => {
   try {
-    if (!helper || !helper.port) {
-      await startHelper();
-    }
+    await ensureHelperReady();
     modelsReady = await probeModelsReady();
     return {
       port: helper.port,
@@ -143,11 +198,12 @@ ipcMain.handle("desktop:get-state", async () => {
 });
 
 ipcMain.handle("desktop:retry-helper", async () => {
-  await startHelper();
+  await startHelper({ force: true });
   return { ok: true, port: helper.port };
 });
 
 ipcMain.handle("desktop:open-app", async () => {
+  await ensureHelperReady();
   await showModelsOrApp();
   return { ok: true, modelsReady };
 });
@@ -183,6 +239,7 @@ app.on("before-quit", async (event) => {
   event.preventDefault();
   const proc = helper;
   helper = null;
+  startPromise = null;
   try {
     await proc.stop();
   } catch (err) {

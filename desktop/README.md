@@ -44,6 +44,7 @@ Linux/cloud VMs **cannot** produce a usable macOS `.dmg`. Build on macOS (iMac /
 ```bash
 brew install git python@3.12 node@20 ffmpeg
 # Node 20+ on PATH (brew link node@20 if needed)
+# Packaged builds copy host ffmpeg into Resources/sidecar/bin (override: MUSICSCRIBE_FFMPEG=…)
 ```
 
 ### One-shot build

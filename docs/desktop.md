@@ -11,6 +11,9 @@ existing UI and a localhost-only Python helper. Songs never leave the machine.
 - **Dev mode** spawns `.venv/bin/python` (macOS/Linux) or `.venv\Scripts\python.exe` (Windows)
   with `python -m bandscribe`.
 - **Models** are downloaded on first run into the OS user-data folder (installer stays lean).
+- **ffmpeg** for decode: Electron sets `PATH` + `IMAGEIO_FFMPEG_EXE` for the helper from a
+  bundled `Resources/sidecar/bin/ffmpeg` (copied at package time) or common host paths
+  (`~/bin`, `/usr/local/bin`, `/opt/homebrew/bin`). macOS GUI apps do not inherit shell PATH.
 
 ## Privacy invariants
 

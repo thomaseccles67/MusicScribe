@@ -1,8 +1,10 @@
 "use strict";
 
 const { spawn } = require("child_process");
+const fs = require("fs");
 const http = require("http");
 const net = require("net");
+const os = require("os");
 const path = require("path");
 const {
   isDev,
@@ -16,6 +18,78 @@ const {
 } = require("./paths");
 
 const DEFAULT_PORT = 8765;
+
+/**
+ * Electron GUI apps on macOS inherit a stripped PATH (/usr/bin:/bin:…).
+ * Decode (librosa / bandscribe.audio.to_wav) needs ffmpeg on PATH or via
+ * IMAGEIO_FFMPEG_EXE. Prefer a bundled binary, then common install locations.
+ */
+function resourceJoins(...parts) {
+  try {
+    const root = resourcesRoot();
+    if (!root || typeof root !== "string") return null;
+    return path.join(root, ...parts);
+  } catch {
+    return null;
+  }
+}
+
+function ffmpegCandidates() {
+  const home = os.homedir();
+  const exe = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+  const roots = [
+    resourceJoins("sidecar", "bin", exe),
+    resourceJoins("sidecar", exe),
+    resourceJoins("bin", exe),
+  ].filter(Boolean);
+  if (process.platform === "darwin" || process.platform === "linux") {
+    roots.push(
+      path.join(home, "bin", exe),
+      path.join("/usr/local/bin", exe),
+      path.join("/opt/homebrew/bin", exe),
+      path.join("/usr/bin", exe)
+    );
+  } else if (process.platform === "win32") {
+    const local = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+    roots.push(
+      path.join(local, "Microsoft", "WinGet", "Links", exe),
+      path.join(home, "scoop", "shims", exe),
+      path.join("C:\\ffmpeg\\bin", exe)
+    );
+  }
+  return roots;
+}
+
+function resolveFfmpeg() {
+  const fromEnv =
+    process.env.IMAGEIO_FFMPEG_EXE ||
+    process.env.FFMPEG_BINARY ||
+    process.env.FFMPEG_PATH;
+  if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+  for (const candidate of ffmpegCandidates()) {
+    try {
+      if (candidate && fs.existsSync(candidate)) return candidate;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+function augmentPath(basePath, dirs) {
+  const parts = (basePath || "")
+    .split(path.delimiter)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const seen = new Set(parts);
+  const prepend = [];
+  for (const dir of dirs) {
+    if (!dir || seen.has(dir)) continue;
+    seen.add(dir);
+    prepend.push(dir);
+  }
+  return [...prepend, ...parts].join(path.delimiter);
+}
 
 function findFreePort(preferred = DEFAULT_PORT) {
   return new Promise((resolve, reject) => {
@@ -53,6 +127,22 @@ function helperEnv() {
   if (isDev()) {
     env.PYTHONPATH = path.join(repoRoot(), "backend");
   }
+
+  const ffmpeg = resolveFfmpeg();
+  const pathDirs = [
+    resourceJoins("sidecar", "bin"),
+    resourceJoins("sidecar"),
+    resourceJoins("bin"),
+    path.join(os.homedir(), "bin"),
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+  ].filter(Boolean);
+  if (ffmpeg) {
+    env.IMAGEIO_FFMPEG_EXE = ffmpeg;
+    env.FFMPEG_BINARY = ffmpeg;
+    pathDirs.unshift(path.dirname(ffmpeg));
+  }
+  env.PATH = augmentPath(env.PATH || process.env.PATH || "", pathDirs);
   return env;
 }
 
@@ -83,9 +173,15 @@ class HelperProcess {
   constructor() {
     this.child = null;
     this.port = null;
+    this.ready = false;
     this.logs = [];
     this.exitCode = null;
     this._listeners = new Set();
+  }
+
+  /** True only after /api/health has returned 200 for this child. */
+  isReady() {
+    return Boolean(this.child && this.port && this.ready);
   }
 
   onLog(fn) {
@@ -102,14 +198,19 @@ class HelperProcess {
   }
 
   async start() {
-    if (this.child) return this.port;
+    if (this.child && this.ready) return this.port;
+    this.ready = false;
     this.port = await findFreePort(DEFAULT_PORT);
     const { command, args, cwd } = buildSpawn();
     const fullArgs = [...args, "--host", "127.0.0.1", "--port", String(this.port)];
-    this._emit(`Starting helper: ${command} ${fullArgs.join(" ")}`);
+    const env = helperEnv();
+    const ffmpegNote = env.IMAGEIO_FFMPEG_EXE
+      ? `ffmpeg=${env.IMAGEIO_FFMPEG_EXE}`
+      : "ffmpeg=not-found (decode may fail)";
+    this._emit(`Starting helper: ${command} ${fullArgs.join(" ")} (${ffmpegNote})`);
     this.child = spawn(command, fullArgs, {
       cwd,
-      env: helperEnv(),
+      env,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -117,6 +218,7 @@ class HelperProcess {
     this.child.stderr.on("data", (buf) => this._emit(buf.toString()));
     this.child.on("exit", (code, signal) => {
       this.exitCode = code;
+      this.ready = false;
       this._emit(`Helper exited (code=${code}, signal=${signal || "none"})`);
       this.child = null;
     });
@@ -124,6 +226,7 @@ class HelperProcess {
       this._emit(`Helper spawn error: ${err.message}`);
     });
     await this.waitUntilReady(90000);
+    this.ready = true;
     return this.port;
   }
 
@@ -206,4 +309,10 @@ class HelperProcess {
   }
 }
 
-module.exports = { HelperProcess, findFreePort, DEFAULT_PORT };
+module.exports = {
+  HelperProcess,
+  findFreePort,
+  DEFAULT_PORT,
+  resolveFfmpeg,
+  helperEnv,
+};
