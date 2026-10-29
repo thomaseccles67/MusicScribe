@@ -83,9 +83,15 @@ class HelperProcess {
   constructor() {
     this.child = null;
     this.port = null;
+    this.ready = false;
     this.logs = [];
     this.exitCode = null;
     this._listeners = new Set();
+  }
+
+  /** True only after /api/health has returned 200 for this child. */
+  isReady() {
+    return Boolean(this.child && this.port && this.ready);
   }
 
   onLog(fn) {
@@ -102,7 +108,8 @@ class HelperProcess {
   }
 
   async start() {
-    if (this.child) return this.port;
+    if (this.child && this.ready) return this.port;
+    this.ready = false;
     this.port = await findFreePort(DEFAULT_PORT);
     const { command, args, cwd } = buildSpawn();
     const fullArgs = [...args, "--host", "127.0.0.1", "--port", String(this.port)];
@@ -117,6 +124,7 @@ class HelperProcess {
     this.child.stderr.on("data", (buf) => this._emit(buf.toString()));
     this.child.on("exit", (code, signal) => {
       this.exitCode = code;
+      this.ready = false;
       this._emit(`Helper exited (code=${code}, signal=${signal || "none"})`);
       this.child = null;
     });
@@ -124,6 +132,7 @@ class HelperProcess {
       this._emit(`Helper spawn error: ${err.message}`);
     });
     await this.waitUntilReady(90000);
+    this.ready = true;
     return this.port;
   }
 
