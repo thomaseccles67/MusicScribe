@@ -57,6 +57,12 @@ SLASH_MARGIN = 0.04
 # Intervals above the root that may appear in the bass even if missing from the template
 # (descending walk-downs like G/F#).
 SLASH_EXTRA = {3, 4, 7, 10, 11}
+# Soft loop bias for repeating short grids (e.g. Gmaj9→D→A→Bm7). Emission-driven:
+# only reweights transitions; never rescales beat posteriors / confidence.
+LOOP_PERIODS = (4, 3, 5, 8)
+LOOP_STAY = 0.72  # slightly softer stay when a cyclic n-gram is detected
+LOOP_BOOST = 3.0  # multiply preferred next-in-loop off-diagonals before row-norm
+LOOP_MIN_MATCH = 0.55  # fraction of pattern tones that must recur across repeats
 
 
 def _states():
@@ -137,6 +143,67 @@ def _label(root: int, suffix: str, names: list[str], bn: np.ndarray, presence: f
     return f"{base}/{names[slash]}" if slash is not None else base
 
 
+def _collapse_runs(path: np.ndarray) -> list[int]:
+    """Collapse consecutive identical states into a change sequence."""
+    out: list[int] = []
+    for k in path:
+        ki = int(k)
+        if not out or out[-1] != ki:
+            out.append(ki)
+    return out
+
+
+def _detect_loop(greedy: np.ndarray) -> list[int] | None:
+    """Find a short repeating state cycle from emission-greedy labels.
+
+    Uses run-collapsed changes so sustained bars still surface the grid.
+    Requires at least one full repeat of a mostly-distinct n-gram. Returns
+    None when evidence is weak — base stay transitions stay unchanged.
+    """
+    changes = _collapse_runs(greedy)
+    best: list[int] | None = None
+    best_score = 0.0
+    for L in LOOP_PERIODS:
+        if len(changes) < L * 2:
+            continue
+        for start in range(min(L, len(changes) - L)):
+            pattern = changes[start : start + L]
+            if len(set(pattern)) < max(3, L - 1):
+                continue
+            matches = 0
+            total = 0
+            for i in range(start + L, len(changes) - L + 1, L):
+                window = changes[i : i + L]
+                total += L
+                matches += sum(a == b for a, b in zip(pattern, window))
+            if total < L:
+                continue
+            score = matches / total
+            if score > best_score and matches >= L:
+                best_score = score
+                best = pattern
+    if best is not None and best_score >= LOOP_MIN_MATCH:
+        return best
+    return None
+
+
+def _transition_matrix(n_states: int, loop: list[int] | None) -> np.ndarray:
+    """Stay-biased transitions; optionally soft-boost edges of a detected loop."""
+    stay = LOOP_STAY if loop and len(loop) >= 3 else STAY_PROB
+    denom = max(n_states - 1, 1)
+    trans = np.full((n_states, n_states), (1.0 - stay) / denom)
+    np.fill_diagonal(trans, stay)
+    if not loop or len(loop) < 3:
+        return trans
+    for i, s in enumerate(loop):
+        nxt = loop[(i + 1) % len(loop)]
+        if s != nxt:
+            trans[s, nxt] *= LOOP_BOOST
+    # Row-normalize so Viterbi still sees a valid Markov matrix.
+    trans /= trans.sum(axis=1, keepdims=True)
+    return trans
+
+
 def recognize(harm: np.ndarray, bass: np.ndarray, sr: int, beats: np.ndarray, duration: float) -> dict:
     chroma = librosa.feature.chroma_cqt(y=harm, sr=sr, hop_length=HOP)
     bchroma = librosa.feature.chroma_cqt(
@@ -179,8 +246,11 @@ def recognize(harm: np.ndarray, bass: np.ndarray, sr: int, beats: np.ndarray, du
     P = np.exp(BETA * (S - S.max(axis=0, keepdims=True)))
     P /= P.sum(axis=0, keepdims=True)
     n_states = P.shape[0]
-    trans = np.full((n_states, n_states), (1 - STAY_PROB) / (n_states - 1))
-    np.fill_diagonal(trans, STAY_PROB)
+    # Detect repeating grids from emission-greedy labels (not sticky Viterbi),
+    # then softly prefer those next-chord transitions. Confidence still uses P.
+    greedy = np.argmax(P, axis=0)
+    loop = _detect_loop(greedy)
+    trans = _transition_matrix(n_states, loop)
     path = librosa.sequence.viterbi(P, trans)
 
     labels = []
